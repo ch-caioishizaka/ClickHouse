@@ -310,7 +310,8 @@ static std::pair<Names, NamesAndTypesList> splitVirtualColumns(
 
 static DataTypePtr replaceTypeNamesToPhysicalRecursively(
     const DataTypePtr & type,
-    const std::string & parent_explicit_name,
+    const std::string & parent_logical_name,
+    const std::string & parent_physical_name,
     const NameToNameMap & physical_names_map)
 {
     const auto * tuple_type = typeid_cast<const DataTypeTuple *>(type.get());
@@ -328,21 +329,30 @@ static DataTypePtr replaceTypeNamesToPhysicalRecursively(
     for (size_t i = 0; i < element_names.size(); ++i)
     {
         const auto & element_name = element_names[i];
-        const auto full_element_name = parent_explicit_name.empty() ? element_name : parent_explicit_name + "." + element_name;
+        const auto full_element_name = parent_logical_name.empty() ? element_name : parent_logical_name + "." + element_name;
 
         auto physical_name = DeltaLake::tryGetPhysicalName(full_element_name, physical_names_map);
+        std::string child_physical_name;
         if (physical_name)
         {
-            auto pos = physical_name->find_last_of('.');
-            if (pos != std::string::npos)
-                physical_name = physical_name->substr(pos + 1);
-            result_element_names[i] = *physical_name;
+            /// The map value is "parent_physical.child_physical". Strip the parent's physical
+            /// name prefix to get just the child's physical name. We cannot use find_last_of('.')
+            /// because the child physical name may itself contain dots (e.g. column mapping
+            /// "name" mode where logical name "a.foo" is also used as the physical name).
+            if (!parent_physical_name.empty() && physical_name->size() > parent_physical_name.size() + 1)
+                child_physical_name = physical_name->substr(parent_physical_name.size() + 1);
+            else
+                child_physical_name = *physical_name;
+            result_element_names[i] = child_physical_name;
         }
         else
+        {
+            child_physical_name = element_name;
             result_element_names[i] = element_name;
+        }
 
         const auto & child_type = elements[i];
-        result_elements[i] = replaceTypeNamesToPhysicalRecursively(child_type, full_element_name, physical_names_map);
+        result_elements[i] = replaceTypeNamesToPhysicalRecursively(child_type, full_element_name, child_physical_name, physical_names_map);
     }
     return std::make_shared<DataTypeTuple>(result_elements, result_element_names);
 }
@@ -357,7 +367,7 @@ static std::pair<NameAndTypePair, bool> getPhysicalNameAndType(
     LoggerPtr log)
 {
     auto physical_name_in_storage = DeltaLake::getPhysicalName(column.getNameInStorage(), physical_names_map);
-    auto physical_type_in_storage = replaceTypeNamesToPhysicalRecursively(column.getTypeInStorage(), column.getNameInStorage(), physical_names_map);
+    auto physical_type_in_storage = replaceTypeNamesToPhysicalRecursively(column.getTypeInStorage(), column.getNameInStorage(), physical_name_in_storage, physical_names_map);
 
     /// Take column from read_schema, but only use it to check if column is readable,
     /// because read_schema_column.type can be different from physical_type_in_storage,

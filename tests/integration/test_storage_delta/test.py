@@ -4582,3 +4582,72 @@ def test_early_return_limit(started_cluster, use_delta_kernel):
         f"Early return should scan 3 files with LIMIT 1, but scanned {scanned_files}"
 
 
+def test_struct_dotted_field_names(started_cluster):
+    """Regression test for struct fields whose logical (and physical) names contain dots.
+
+    In Delta Lake column mapping "name" mode the physical name equals the logical name,
+    so a field named `a.foo` has physical name `a.foo`.  The map value for the child is
+    therefore "data.a.foo" (parent_physical + "." + child_physical).  The old code used
+    `find_last_of('.')` to strip the parent prefix, which found the wrong dot and turned
+    every field into its last segment (e.g. "foo").  Duplicate segment names then caused
+    a `DUPLICATE_COLUMN` exception on `SELECT *` (Bug A) and silent NULLs on sub-field
+    access (Bug B).
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    table_name = randomize_table_name("test_struct_dotted_field_names")
+    path = f"/var/lib/clickhouse/user_files/{table_name}"
+
+    spark.sql(
+        f"""
+        CREATE TABLE {table_name} (
+            id        BIGINT,
+            data      STRUCT<`a.foo`: STRING, `b.foo`: STRING>,
+            data_deep STRUCT<`a.b.c.bar`: STRING, `a.b.d.bar`: STRING, `a.b.c.d.e.bar`: STRING, `a.bar`: STRING>
+        )
+        USING DELTA
+        LOCATION '{path}'
+        TBLPROPERTIES (
+            'delta.minReaderVersion' = '2',
+            'delta.minWriterVersion' = '5',
+            'delta.columnMapping.mode' = 'name'
+        )
+        """
+    )
+    spark.sql(
+        f"""
+        INSERT INTO {table_name}
+        VALUES (
+            1,
+            named_struct('a.foo', 'hello', 'b.foo', 'world'),
+            named_struct('a.b.c.bar', 'abcbar', 'a.b.d.bar', 'abdbar', 'a.b.c.d.e.bar', 'abcdebar', 'a.bar', 'abar')
+        )
+        """
+    )
+    LocalUploader(instance).upload_directory(f"{path}/", f"{path}/")
+
+    table_function = f"deltaLakeLocal('{path}')"
+
+    # Bug A: SELECT * must not raise DUPLICATE_COLUMN
+    result = instance.query(f"SELECT * FROM {table_function}").strip()
+    assert result == "1\t('hello','world')\t('abcbar','abdbar','abcdebar','abar')", \
+        f"Unexpected SELECT * result: {result!r}"
+
+    # Bug B: sub-field access must return actual values, not NULL
+    result_a = instance.query(f"SELECT data.`a.foo` FROM {table_function}").strip()
+    assert result_a == "hello", f"Unexpected data.`a.foo` result: {result_a!r}"
+
+    result_b = instance.query(f"SELECT data.`b.foo` FROM {table_function}").strip()
+    assert result_b == "world", f"Unexpected data.`b.foo` result: {result_b!r}"
+
+    result_abc = instance.query(f"SELECT data_deep.`a.b.c.bar` FROM {table_function}").strip()
+    assert result_abc == "abcbar", f"Unexpected data_deep.`a.b.c.bar` result: {result_abc!r}"
+
+    result_abd = instance.query(f"SELECT data_deep.`a.b.d.bar` FROM {table_function}").strip()
+    assert result_abd == "abdbar", f"Unexpected data_deep.`a.b.d.bar` result: {result_abd!r}"
+
+    result_abcde = instance.query(f"SELECT data_deep.`a.b.c.d.e.bar` FROM {table_function}").strip()
+    assert result_abcde == "abcdebar", f"Unexpected data_deep.`a.b.c.d.e.bar` result: {result_abcde!r}"
+
+    result_abar = instance.query(f"SELECT data_deep.`a.bar` FROM {table_function}").strip()
+    assert result_abar == "abar", f"Unexpected data_deep.`a.bar` result: {result_abar!r}"
