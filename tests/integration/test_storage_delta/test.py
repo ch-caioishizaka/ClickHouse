@@ -4598,12 +4598,16 @@ def test_struct_dotted_field_names(started_cluster):
     table_name = randomize_table_name("test_struct_dotted_field_names")
     path = f"/var/lib/clickhouse/user_files/{table_name}"
 
+    # ── Table 1: column mapping "name" mode ──────────────────────────────────────
     spark.sql(
         f"""
         CREATE TABLE {table_name} (
             id        BIGINT,
             data      STRUCT<`a.foo`: STRING, `b.foo`: STRING>,
-            data_deep STRUCT<`a.b.c.bar`: STRING, `a.b.d.bar`: STRING, `a.b.c.d.e.bar`: STRING, `a.bar`: STRING>
+            data_deep STRUCT<`a.b.c.bar`: STRING, `a.b.d.bar`: STRING, `a.b.c.d.e.bar`: STRING, `a.bar`: STRING>,
+            d2        STRUCT<inner: STRUCT<`a.foo`: STRING, `b.foo`: STRING>>,
+            d3        STRUCT<l2: STRUCT<l3: STRUCT<`a.foo`: STRING, `b.foo`: STRING>>>,
+            d4        STRUCT<l2: STRUCT<l3: STRUCT<l4: STRUCT<`a.foo`: STRING, `b.foo`: STRING>>>>
         )
         USING DELTA
         LOCATION '{path}'
@@ -4620,7 +4624,10 @@ def test_struct_dotted_field_names(started_cluster):
         VALUES (
             1,
             named_struct('a.foo', 'hello', 'b.foo', 'world'),
-            named_struct('a.b.c.bar', 'abcbar', 'a.b.d.bar', 'abdbar', 'a.b.c.d.e.bar', 'abcdebar', 'a.bar', 'abar')
+            named_struct('a.b.c.bar', 'abcbar', 'a.b.d.bar', 'abdbar', 'a.b.c.d.e.bar', 'abcdebar', 'a.bar', 'abar'),
+            named_struct('inner', named_struct('a.foo', 'afoo2', 'b.foo', 'bfoo2')),
+            named_struct('l2', named_struct('l3', named_struct('a.foo', 'afoo3', 'b.foo', 'bfoo3'))),
+            named_struct('l2', named_struct('l3', named_struct('l4', named_struct('a.foo', 'afoo4', 'b.foo', 'bfoo4'))))
         )
         """
     )
@@ -4630,10 +4637,10 @@ def test_struct_dotted_field_names(started_cluster):
 
     # Bug A: SELECT * must not raise DUPLICATE_COLUMN
     result = instance.query(f"SELECT * FROM {table_function}").strip()
-    assert result == "1\t('hello','world')\t('abcbar','abdbar','abcdebar','abar')", \
+    assert result == "1\t('hello','world')\t('abcbar','abdbar','abcdebar','abar')\t(('afoo2','bfoo2'))\t((('afoo3','bfoo3')))\t(((('afoo4','bfoo4'))))", \
         f"Unexpected SELECT * result: {result!r}"
 
-    # Bug B: sub-field access must return actual values, not NULL
+    # Bug B: depth-1 sub-field access must return actual values, not NULL
     result_a = instance.query(f"SELECT data.`a.foo` FROM {table_function}").strip()
     assert result_a == "hello", f"Unexpected data.`a.foo` result: {result_a!r}"
 
@@ -4651,3 +4658,61 @@ def test_struct_dotted_field_names(started_cluster):
 
     result_abar = instance.query(f"SELECT data_deep.`a.bar` FROM {table_function}").strip()
     assert result_abar == "abar", f"Unexpected data_deep.`a.bar` result: {result_abar!r}"
+
+    # Depth 2, 3, 4 sub-field access
+    result_d2 = instance.query(f"SELECT d2.inner.`a.foo` FROM {table_function}").strip()
+    assert result_d2 == "afoo2", f"Unexpected d2.inner.`a.foo` result: {result_d2!r}"
+
+    result_d3 = instance.query(f"SELECT d3.l2.l3.`a.foo` FROM {table_function}").strip()
+    assert result_d3 == "afoo3", f"Unexpected d3.l2.l3.`a.foo` result: {result_d3!r}"
+
+    result_d4 = instance.query(f"SELECT d4.l2.l3.l4.`a.foo` FROM {table_function}").strip()
+    assert result_d4 == "afoo4", f"Unexpected d4.l2.l3.l4.`a.foo` result: {result_d4!r}"
+
+    # ── Table 2: no column mapping (default) ─────────────────────────────────────
+    table_name2 = randomize_table_name("test_struct_dotted_field_names_no_cm")
+    path2 = f"/var/lib/clickhouse/user_files/{table_name2}"
+
+    spark.sql(
+        f"""
+        CREATE TABLE {table_name2} (
+            id        BIGINT,
+            data      STRUCT<`a.foo`: STRING, `b.foo`: STRING>,
+            data_deep STRUCT<`a.b.c.bar`: STRING, `a.b.d.bar`: STRING, `a.b.c.d.e.bar`: STRING, `a.bar`: STRING>,
+            d2        STRUCT<inner: STRUCT<`a.foo`: STRING, `b.foo`: STRING>>,
+            d3        STRUCT<l2: STRUCT<l3: STRUCT<`a.foo`: STRING, `b.foo`: STRING>>>,
+            d4        STRUCT<l2: STRUCT<l3: STRUCT<l4: STRUCT<`a.foo`: STRING, `b.foo`: STRING>>>>
+        )
+        USING DELTA
+        LOCATION '{path2}'
+        TBLPROPERTIES (
+            'delta.minReaderVersion' = '2',
+            'delta.minWriterVersion' = '5'
+        )
+        """
+    )
+    spark.sql(
+        f"""
+        INSERT INTO {table_name2}
+        VALUES (
+            1,
+            named_struct('a.foo', 'hello', 'b.foo', 'world'),
+            named_struct('a.b.c.bar', 'abcbar', 'a.b.d.bar', 'abdbar', 'a.b.c.d.e.bar', 'abcdebar', 'a.bar', 'abar'),
+            named_struct('inner', named_struct('a.foo', 'afoo2', 'b.foo', 'bfoo2')),
+            named_struct('l2', named_struct('l3', named_struct('a.foo', 'afoo3', 'b.foo', 'bfoo3'))),
+            named_struct('l2', named_struct('l3', named_struct('l4', named_struct('a.foo', 'afoo4', 'b.foo', 'bfoo4'))))
+        )
+        """
+    )
+    LocalUploader(instance).upload_directory(f"{path2}/", f"{path2}/")
+
+    table_function2 = f"deltaLakeLocal('{path2}')"
+
+    result2_d2 = instance.query(f"SELECT d2.inner.`a.foo` FROM {table_function}").strip()
+    assert result2_d2 == "afoo2", f"Unexpected d2.inner.`a.foo` result: {result_d2!r}"
+
+    result2_d3 = instance.query(f"SELECT d3.l2.l3.`a.foo` FROM {table_function}").strip()
+    assert result2_d3 == "afoo3", f"Unexpected d3.l2.l3.`a.foo` result: {result_d3!r}"
+
+    result2_d4 = instance.query(f"SELECT d4.l2.l3.l4.`a.foo` FROM {table_function}").strip()
+    assert result2_d4 == "afoo4", f"Unexpected d4.l2.l3.l4.`a.foo` result: {result_d4!r}"
